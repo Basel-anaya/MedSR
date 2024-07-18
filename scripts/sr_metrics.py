@@ -66,18 +66,3 @@ def calculate_metrics(sr_image, hr_image, lpips_fn=None):
         metrics['LPIPS'] = calculate_lpips(sr_image, hr_image, lpips_fn)
     
     return metrics
-
-# Usage example
-if __name__ == "__main__":
-    # Simulating super-resolved and high-res images
-    sr_image = torch.rand(1, 1, 256, 256)
-    hr_image = torch.rand(1, 1, 256, 256)
-    
-    # If you want to use LPIPS, you need to install and import it
-    # import lpips
-    # loss_fn_alex = lpips.LPIPS(net='alex')
-    
-    metrics = calculate_metrics(sr_image, hr_image)  # , lpips_fn=loss_fn_alex)
-    
-    for metric, value in metrics.items():
-        print(f"{metric}: {value}")
