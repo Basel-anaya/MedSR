@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from jax import random, jit, value_and_grad
+from jax import random, jit, value_and_grad, pmap, local_device_count, device_put_replicated
 import optax
 from flax import linen as nn
 from flax.training import train_state
@@ -33,6 +33,7 @@ def parse_args():
     parser.add_argument('--output_dir', type=str, default='./output', help='Output directory for saved models')
     parser.add_argument('--save_interval', type=int, default=10, help='Save model every n epochs')
     parser.add_argument('--log_interval', type=int, default=100, help='Log training progress every n steps')
+    parser.add_argument('--num_devices', type=int, default=None, help='Number of devices to use for training')
     return parser.parse_args()
 
 def get_model(model_name):
@@ -72,15 +73,16 @@ def eval_step(state, loss_fn, batch):
     metrics = calculate_metrics(outputs, batch['hr'])
     return loss, metrics
 
-def train_epoch(state, loss_fn, train_loader, rng):
+def train_epoch(state, loss_fn, train_loader, num_devices):
     epoch_loss = 0
     for batch in tqdm(train_loader, desc="Training"):
-        rng, step_rng = random.split(rng)
-        state, loss, _ = train_step(state, loss_fn, batch, step_rng)
-        epoch_loss += loss
+        batch = {k: jnp.array(v) for k, v in batch.items()}
+        batch = {k: device_put_replicated(v, devices=jax.devices()[:num_devices]) for k, v in batch.items()}
+        state, loss = pmap(train_step, axis_name='devices')(state, loss_fn, batch)
+        epoch_loss += jnp.mean(loss)
     return state, epoch_loss / len(train_loader)
 
-def eval_model(state, loss_fn, val_loader):
+def eval_model(state, loss_fn, val_loader, num_devices):
     val_loss = 0
     val_metrics = {
         'PSNR': 0,
@@ -90,10 +92,12 @@ def eval_model(state, loss_fn, val_loader):
         'Edge_PSNR': 0
     }
     for batch in tqdm(val_loader, desc="Evaluating"):
-        loss, metrics = eval_step(state, loss_fn, batch)
-        val_loss += loss
+        batch = {k: jnp.array(v) for k, v in batch.items()}
+        batch = {k: device_put_replicated(v, devices=jax.devices()[:num_devices]) for k, v in batch.items()}
+        loss, metrics = pmap(eval_step, axis_name='devices')(state, loss_fn, batch)
+        val_loss += jnp.mean(loss)
         for k, v in metrics.items():
-            val_metrics[k] += v
+            val_metrics[k] += jnp.mean(v)
     
     val_loss /= len(val_loader)
     for k in val_metrics:
@@ -103,6 +107,13 @@ def eval_model(state, loss_fn, val_loader):
 def train(args):
     # Set up JAX random key
     rng = random.PRNGKey(0)
+
+    # Determine number of devices
+    if args.num_devices is None:
+        num_devices = local_device_count()
+    else:
+        num_devices = min(args.num_devices, local_device_count())
+    print(f"Training on {num_devices} devices")
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -126,7 +137,10 @@ def train(args):
 
     # Initialize the training state
     rng, init_rng = random.split(rng)
-    state, loss_fn = create_train_state(init_rng, model, args.lr, (args.batch_size, 64, 64, 3))  # Note the NHWC format
+    init_rng = random.split(init_rng, num_devices)
+    state, loss_fn = create_train_state(init_rng[0], model, args.lr, (args.batch_size // num_devices, 64, 64, 3))
+    state = device_put_replicated(state, devices=jax.devices()[:num_devices])
+    loss_fn = device_put_replicated(loss_fn, devices=jax.devices()[:num_devices])
 
     # Training loop
     train_losses = []
@@ -140,14 +154,12 @@ def train(args):
     }
     
     for epoch in range(args.epochs):
-        rng, epoch_rng = random.split(rng)
-        state, train_loss = train_epoch(state, loss_fn, train_loader, epoch_rng)
+        state, train_loss = train_epoch(state, loss_fn, train_loader, num_devices)
         train_losses.append(train_loss)
         
-        val_loss, val_metrics = eval_model(state, loss_fn, val_loader)
+        val_loss, val_metrics = eval_model(state, loss_fn, val_loader, num_devices)
         val_losses.append(val_loss)
 
-        # Store the metrics for this epoch
         for k, v in val_metrics.items():
             val_metrics_history[k].append(v)
 
@@ -160,13 +172,13 @@ def train(args):
         if (epoch + 1) % args.save_interval == 0:
             model_path = os.path.join(args.output_dir, f"{args.model}_epoch_{epoch+1}.pkl")
             with open(model_path, 'wb') as f:
-                pickle.dump(state, f)
+                pickle.dump(jax.device_get(state), f)
             print(f"Model saved to {model_path}")
 
     # Save final model
     final_model_path = os.path.join(args.output_dir, f"{args.model}_final.pkl")
     with open(final_model_path, 'wb') as f:
-        pickle.dump(state, f)
+        pickle.dump(jax.device_get(state), f)
     print(f"Final model saved to {final_model_path}")
 
     # Plot losses
