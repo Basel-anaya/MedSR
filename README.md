@@ -1,5 +1,4 @@
-# Super Resolution for Medical Images ☠️
-> #### _Archit | Spring '23 | Duke AIPI 540 Final Project_
+# Super Resolution for Medical Images
 &nbsp;
 
 ## Project Description ⭐  
