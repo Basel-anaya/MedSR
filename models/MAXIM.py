@@ -1,81 +1,82 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
+from typing import Any, Tuple
 
 class MultiAxisMLP(nn.Module):
-    def __init__(self, dim, hidden_dim, dropout=0.0):
-        super().__init__()
-        self.mlp_h = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
-            nn.Dropout(dropout)
-        )
-        self.mlp_w = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
-            nn.Dropout(dropout)
-        )
-        self.mlp_c = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
-            nn.Dropout(dropout)
-        )
+    dim: int
+    hidden_dim: int
+    dropout: float = 0.0
 
-    def forward(self, x):
-        B, C, H, W = x.shape
-        x_h = self.mlp_h(x.permute(0, 3, 1, 2).reshape(-1, C)).reshape(B, W, C, H).permute(0, 2, 3, 1)
-        x_w = self.mlp_w(x.permute(0, 2, 1, 3).reshape(-1, C)).reshape(B, H, C, W).permute(0, 2, 1, 3)
-        x_c = self.mlp_c(x.reshape(B, C, -1).transpose(1, 2)).transpose(1, 2).reshape(B, C, H, W)
+    @nn.compact
+    def __call__(self, x, deterministic: bool = True):
+        def mlp():
+            return nn.Sequential([
+                nn.Dense(self.hidden_dim),
+                nn.gelu,
+                nn.Dropout(self.dropout, deterministic=deterministic),
+                nn.Dense(self.dim),
+                nn.Dropout(self.dropout, deterministic=deterministic)
+            ])
+
+        B, H, W, C = x.shape
+        
+        x_h = mlp()(jnp.reshape(jnp.transpose(x, (0, 3, 1, 2)), (-1, C)))
+        x_h = jnp.transpose(jnp.reshape(x_h, (B, W, C, H)), (0, 2, 3, 1))
+        
+        x_w = mlp()(jnp.reshape(jnp.transpose(x, (0, 2, 1, 3)), (-1, C)))
+        x_w = jnp.transpose(jnp.reshape(x_w, (B, H, C, W)), (0, 2, 1, 3))
+        
+        x_c = mlp()(jnp.reshape(jnp.transpose(x, (0, 3, 1, 2)), (B, -1, C)))
+        x_c = jnp.reshape(jnp.transpose(x_c, (0, 2, 1)), (B, C, H, W))
+        
         return x_h + x_w + x_c
 
 class MAXIMBlock(nn.Module):
-    def __init__(self, dim, hidden_dim, mlp_ratio=4., dropout=0.0, layerscale_init=1e-5):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = MultiAxisMLP(dim, hidden_dim, dropout)
-        self.norm2 = nn.LayerNorm(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, mlp_hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(mlp_hidden_dim, dim),
-            nn.Dropout(dropout)
-        )
-        self.ls1 = nn.Parameter(layerscale_init * torch.ones(dim))
-        self.ls2 = nn.Parameter(layerscale_init * torch.ones(dim))
+    dim: int
+    hidden_dim: int
+    mlp_ratio: float = 4.
+    dropout: float = 0.0
+    layerscale_init: float = 1e-5
 
-    def forward(self, x):
-        x = x + self.ls1.unsqueeze(-1).unsqueeze(-1) * self.attn(self.norm1(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2))
-        x = x + self.ls2.unsqueeze(-1).unsqueeze(-1) * self.mlp(self.norm2(x.permute(0, 2, 3, 1))).permute(0, 3, 1, 2)
+    @nn.compact
+    def __call__(self, x, deterministic: bool = True):
+        norm1 = nn.LayerNorm()(x)
+        attn = MultiAxisMLP(self.dim, self.hidden_dim, self.dropout)(norm1, deterministic)
+        ls1 = self.param('ls1', nn.initializers.constant(self.layerscale_init), (self.dim,))
+        x = x + ls1[None, None, None, :] * attn
+
+        norm2 = nn.LayerNorm()(x)
+        mlp_hidden_dim = int(self.dim * self.mlp_ratio)
+        mlp = nn.Sequential([
+            nn.Dense(mlp_hidden_dim),
+            nn.gelu,
+            nn.Dropout(self.dropout, deterministic=deterministic),
+            nn.Dense(self.dim),
+            nn.Dropout(self.dropout, deterministic=deterministic)
+        ])
+        ls2 = self.param('ls2', nn.initializers.constant(self.layerscale_init), (self.dim,))
+        x = x + ls2[None, None, None, :] * mlp(norm2)
         return x
 
 class MAXIM(nn.Module):
-    def __init__(self, in_channels=3, out_channels=3, dim=64, depth=4, hidden_dim=128, dropout=0.0):
-        super().__init__()
-        self.embed = nn.Sequential(
-            nn.Conv2d(in_channels, dim, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1)
-        )
-        self.blocks = nn.ModuleList([
-            MAXIMBlock(dim, hidden_dim, dropout=dropout) for _ in range(depth)
-        ])
-        self.head = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(dim, out_channels, kernel_size=3, padding=1)
-        )
+    in_channels: int = 3
+    out_channels: int = 3
+    dim: int = 64
+    depth: int = 4
+    hidden_dim: int = 128
+    dropout: float = 0.0
 
-    def forward(self, x):
-        x = self.embed(x)
-        for block in self.blocks:
-            x = block(x)
-        x = self.head(x)
+    @nn.compact
+    def __call__(self, x, deterministic: bool = True):
+        x = nn.Conv(self.dim, kernel_size=(3, 3), padding='SAME')(x)
+        x = nn.gelu(x)
+        x = nn.Conv(self.dim, kernel_size=(3, 3), padding='SAME')(x)
+
+        for _ in range(self.depth):
+            x = MAXIMBlock(self.dim, self.hidden_dim, dropout=self.dropout)(x, deterministic)
+
+        x = nn.Conv(self.dim, kernel_size=(3, 3), padding='SAME')(x)
+        x = nn.gelu(x)
+        x = nn.Conv(self.out_channels, kernel_size=(3, 3), padding='SAME')(x)
         return x
